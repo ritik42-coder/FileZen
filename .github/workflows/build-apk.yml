@@ -1,7 +1,6 @@
 name: Build APK
 on:
   push:
-    branches: [main, master]
   workflow_dispatch:
 jobs:
   build:
@@ -15,24 +14,31 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - name: Install dependencies
-        run: npm install
-      - name: Add Android platform
-        run: npx cap add android
-      - name: Native setup (permissions + plugin)
+      - name: Unzip and find project
         run: |
-          D=android/app/src/main/java/com/filezen/app
-          cp native/PermPlugin.java native/MainActivity.java $D/
-          M=android/app/src/main/AndroidManifest.xml
-          sed -i 's#<application#<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><application android:requestLegacyExternalStorage="true"#' $M
+          mkdir -p /tmp/proj
+          find . -name "*.zip" -not -path "./.git/*" -exec unzip -oq {} -d /tmp/proj \;
+          F=$(find /tmp/proj -name capacitor.config.json | head -1)
+          if [ -z "$F" ]; then F=$(find . -name capacitor.config.json -not -path "*/node_modules/*" | head -1); fi
+          if [ -z "$F" ]; then echo "ERROR: no project found. Upload FileZen.zip to the repo."; find . -not -path "./.git/*" | head -30; exit 1; fi
+          echo "APP_DIR=$(cd "$(dirname "$F")" && pwd)" >> $GITHUB_ENV
+      - name: Install dependencies
+        run: cd "$APP_DIR" && npm install
+      - name: Add Android platform
+        run: cd "$APP_DIR" && npx cap add android
+      - name: Native setup
+        run: |
+          cd "$APP_DIR"
+          cp native/PermPlugin.java native/MainActivity.java android/app/src/main/java/com/filezen/app/
+          sed -i 's#<application#<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><application android:requestLegacyExternalStorage="true"#' android/app/src/main/AndroidManifest.xml
       - name: Sync web assets
-        run: npx cap sync android
+        run: cd "$APP_DIR" && npx cap sync android
       - name: Build debug APK
         run: |
-          cd android
+          cd "$APP_DIR/android"
           chmod +x gradlew
           ./gradlew assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: FileZen-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
