@@ -1,44 +1,161 @@
 name: Build APK
+
 on:
   push:
+    branches: [main, master]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - name: Unzip and find project
+
+      # Works whether the project sits at the repo root, inside FileZen/, or is still a zip.
+      # An already-extracted folder always wins over the zip, so a stale zip can never
+      # overwrite newer source files.
+      - name: Prepare project
         run: |
-          mkdir -p /tmp/proj
-          find . -name "*.zip" -not -path "./.git/*" -exec unzip -oq {} -d /tmp/proj \;
-          F=$(find /tmp/proj -name capacitor.config.json | head -1)
-          if [ -z "$F" ]; then F=$(find . -name capacitor.config.json -not -path "*/node_modules/*" | head -1); fi
-          if [ -z "$F" ]; then echo "ERROR: no project found. Upload FileZen.zip to the repo."; find . -not -path "./.git/*" | head -30; exit 1; fi
-          echo "APP_DIR=$(cd "$(dirname "$F")" && pwd)" >> $GITHUB_ENV
+          set -euo pipefail
+          if [ ! -f www/index.html ]; then
+            if [ -f FileZen/www/index.html ]; then
+              echo "Using the checked-in FileZen/ folder"
+            else
+              for z in *.zip; do
+                [ -e "$z" ] || continue
+                echo "Extracting $z"
+                unzip -o -q "$z"
+              done
+            fi
+            if [ -d FileZen ]; then cp -r FileZen/. . ; fi
+          fi
+
+          for f in www/index.html package.json capacitor.config.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f not found. Upload the FileZen folder, or FileZen.zip, at the repo root."
+              exit 1
+            fi
+          done
+
+          # Single source of truth: native/ holds the Java the app is built from.
+          for f in FzCore PermPlugin MainActivity; do
+            if [ ! -s "native/$f.java" ]; then
+              echo "::error::native/$f.java is missing. The whole FileZen folder must be in the repo (the native/ directory is required)."
+              exit 1
+            fi
+          done
+          echo "Project files:"
+          ls -la
+          ls -la native
+
       - name: Install dependencies
-        run: cd "$APP_DIR" && npm install
+        run: npm install --no-audit --no-fund
+
       - name: Add Android platform
-        run: cd "$APP_DIR" && npx cap add android
-      - name: Native setup
         run: |
-          cd "$APP_DIR"
-          cp native/PermPlugin.java native/MainActivity.java android/app/src/main/java/com/filezen/app/
-          sed -i 's#<application#<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/><uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/><application android:requestLegacyExternalStorage="true"#' android/app/src/main/AndroidManifest.xml
+          set -euo pipefail
+          rm -rf android
+          npx cap add android
+
       - name: Sync web assets
-        run: cd "$APP_DIR" && npx cap sync android
+        run: npx cap sync android
+
+      # Native code goes in AFTER cap sync, so nothing regenerates over it.
+      - name: Native setup (permissions, plugin, FileProvider)
+        run: |
+          set -euo pipefail
+          D=android/app/src/main/java/com/filezen/app
+          mkdir -p "$D" android/app/src/main/res/xml
+
+          cp native/FzCore.java       "$D/FzCore.java"
+          cp native/PermPlugin.java   "$D/PermPlugin.java"
+          cp native/MainActivity.java "$D/MainActivity.java"
+          cp native/file_paths.xml    android/app/src/main/res/xml/file_paths.xml
+
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+
+          perms = [
+              'android.permission.MANAGE_EXTERNAL_STORAGE',
+              'android.permission.READ_EXTERNAL_STORAGE',
+              'android.permission.WRITE_EXTERNAL_STORAGE',
+              'android.permission.READ_MEDIA_IMAGES',
+              'android.permission.READ_MEDIA_VIDEO',
+              'android.permission.READ_MEDIA_AUDIO',
+          ]
+          missing = [x for x in perms if x not in s]
+          if missing:
+              block = ''.join('    <uses-permission android:name="%s"/>\n' % x for x in missing)
+              i = s.index('<application')
+              s = s[:i] + block + s[i:]
+
+          if 'requestLegacyExternalStorage' not in s:
+              s = s.replace('<application',
+                            '<application\n        android:requestLegacyExternalStorage="true"', 1)
+
+          # The Capacitor template already ships this provider, so only add one if it is absent.
+          if 'fileprovider' not in s:
+              provider = (
+                  '    <provider\n'
+                  '        android:name="androidx.core.content.FileProvider"\n'
+                  '        android:authorities="${applicationId}.fileprovider"\n'
+                  '        android:exported="false"\n'
+                  '        android:grantUriPermissions="true">\n'
+                  '        <meta-data android:name="android.support.FILE_PROVIDER_PATHS"\n'
+                  '            android:resource="@xml/file_paths"/>\n'
+                  '    </provider>\n'
+              )
+              s = s.replace('</application>', provider + '</application>', 1)
+
+          open(p, 'w').write(s)
+          print('manifest patched')
+          PY
+
+      # Fails here, with a readable message, instead of 15 "cannot find symbol" errors later.
+      - name: Verify native sources
+        run: |
+          set -euo pipefail
+          D=android/app/src/main/java/com/filezen/app
+          echo "Java files in the compile set:"
+          find android/app/src/main/java -name '*.java' | sort
+          for f in FzCore PermPlugin MainActivity; do
+            if [ ! -s "$D/$f.java" ]; then
+              echo "::error::$D/$f.java is missing from the compile set."
+              exit 1
+            fi
+            if ! grep -q "class $f" "$D/$f.java"; then
+              echo "::error::$f.java does not declare class $f (file is corrupted or truncated)."
+              exit 1
+            fi
+          done
+          if ! grep -q 'FzCore\.' "$D/PermPlugin.java"; then
+            echo "::error::PermPlugin.java does not reference FzCore — wrong version of the file."
+            exit 1
+          fi
+          # FzCore is pure Java, so a real javac pass proves the engine file is whole.
+          javac -d /tmp/fzcheck "$D/FzCore.java"
+          test -f /tmp/fzcheck/com/filezen/app/FzCore.class
+          echo "FzCore.java compiles cleanly."
+          md5sum "$D"/*.java
+
       - name: Build debug APK
         run: |
-          cd "$APP_DIR/android"
+          cd android
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
           name: FileZen-APK
-          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
