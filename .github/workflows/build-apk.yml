@@ -92,6 +92,12 @@ jobs:
               'android.permission.READ_MEDIA_IMAGES',
               'android.permission.READ_MEDIA_VIDEO',
               'android.permission.READ_MEDIA_AUDIO',
+              # AirLink (phone-to-phone transfer): sockets, Wi-Fi info, app list, installing received APKs
+              'android.permission.INTERNET',
+              'android.permission.ACCESS_NETWORK_STATE',
+              'android.permission.ACCESS_WIFI_STATE',
+              'android.permission.QUERY_ALL_PACKAGES',
+              'android.permission.REQUEST_INSTALL_PACKAGES',
           ]
           missing = [x for x in perms if x not in s]
           if missing:
